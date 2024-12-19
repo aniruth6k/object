@@ -10,7 +10,7 @@ from deepface import DeepFace
 from supabase import create_client, Client
 import datetime
 from typing import Dict, List
-from pydantic import BaseModel
+from pydantic import BaseModel, validator
 import base64
 from geopy.geocoders import Nominatim
 import tensorflow as tf
@@ -18,6 +18,8 @@ import tempfile
 import logging
 import shutil
 import traceback
+from PIL import Image
+import io
 
 tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
@@ -29,6 +31,26 @@ class LocationData(BaseModel):
     longitude: float
     image: str
     is_checkout: bool = False
+    
+    @validator('latitude')
+    def validate_latitude(cls, v):
+        if not -90 <= v <= 90:
+            raise ValueError('Invalid latitude value')
+        return v
+    
+    @validator('longitude')
+    def validate_longitude(cls, v):
+        if not -180 <= v <= 180:
+            raise ValueError('Invalid longitude value')
+        return v
+    
+    @validator('image')
+    def validate_image(cls, v):
+        try:
+            base64.b64decode(v)
+        except:
+            raise ValueError('Invalid base64 image')
+        return v
 
 class Response(BaseModel):
     success: bool
@@ -69,154 +91,245 @@ def initialize_db():
 
 def verify_face_in_image(image_path: str) -> bool:
     try:
-        face = DeepFace.extract_faces(
-            img_path=image_path,
-            enforce_detection=True,
-            detector_backend='opencv'
-        )
-        return len(face) > 0
+        # Try multiple face detection backends in order of reliability
+        backends = ['retinaface', 'mtcnn', 'opencv', 'ssd']
+        
+        for backend in backends:
+            try:
+                faces = DeepFace.extract_faces(
+                    img_path=image_path,
+                    enforce_detection=True,
+                    detector_backend=backend
+                )
+                if len(faces) > 0:
+                    # Verify face quality
+                    img = cv2.imread(image_path)
+                    face = faces[0]
+                    face_region = img[
+                        face['facial_area']['y']:face['facial_area']['y'] + face['facial_area']['h'],
+                        face['facial_area']['x']:face['facial_area']['x'] + face['facial_area']['w']
+                    ]
+                    
+                    # Check face size
+                    if face['facial_area']['w'] < 100 or face['facial_area']['h'] < 100:
+                        continue
+                        
+                    # Check face confidence
+                    if face.get('confidence', 0) < 0.9:
+                        continue
+                        
+                    # Check for blur
+                    gray = cv2.cvtColor(face_region, cv2.COLOR_BGR2GRAY)
+                    blur_value = cv2.Laplacian(gray, cv2.CV_64F).var()
+                    if blur_value < 100:  # Adjust threshold as needed
+                        continue
+                        
+                    return True
+            except:
+                continue
+                
+        return False
     except Exception as e:
         logger.error(f"Face detection failed: {str(e)}")
         return False
 
+def preprocess_image(image_path: str) -> str:
+    try:
+        # Read image
+        img = cv2.imread(image_path)
+        if img is None:
+            return image_path
+            
+        # Convert to grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Apply histogram equalization
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+        enhanced = clahe.apply(gray)
+        
+        # Denoise
+        denoised = cv2.fastNlMeansDenoising(enhanced)
+        
+        # Enhance edges
+        edges = cv2.Canny(denoised, 50, 150)
+        enhanced_edges = cv2.addWeighted(denoised, 0.7, edges, 0.3, 0)
+        
+        # Convert back to BGR
+        enhanced_bgr = cv2.cvtColor(enhanced_edges, cv2.COLOR_GRAY2BGR)
+        
+        # Adjust brightness and contrast
+        alpha = 1.2  # Contrast
+        beta = 10    # Brightness
+        adjusted = cv2.convertScaleAbs(enhanced_bgr, alpha=alpha, beta=beta)
+        
+        # Save preprocessed image
+        preprocessed_path = image_path.replace('.jpg', '_preprocessed.jpg')
+        cv2.imwrite(preprocessed_path, adjusted)
+        
+        return preprocessed_path
+    except Exception as e:
+        logger.error(f"Image preprocessing failed: {str(e)}")
+        return image_path
+
+def find_matching_face(img_path: str, confidence_threshold: float = 0.6) -> tuple:
+    """Returns (faculty_id, confidence) if match found, else (None, 0)"""
+    try:
+        # Try multiple recognition models
+        models = ['VGG-Face', 'Facenet', 'OpenFace']
+        metrics = ['cosine', 'euclidean']
+        
+        best_match = None
+        best_confidence = 0
+        
+        for model in models:
+            for metric in metrics:
+                try:
+                    result = DeepFace.find(
+                        img_path=img_path,
+                        db_path="faculty_photos_db",
+                        enforce_detection=False,
+                        model_name=model,
+                        distance_metric=metric,
+                        detector_backend='retinaface'
+                    )
+                    
+                    if isinstance(result, list) and len(result) > 0 and not result[0].empty:
+                        df_result = result[0]
+                        df_result = df_result.sort_values('distance')
+                        match = df_result.iloc[0]
+                        
+                        confidence = 1 - float(match['distance'])
+                        if confidence > best_confidence:
+                            identity_path = match['identity']
+                            faculty_id = os.path.splitext(os.path.basename(identity_path))[0]
+                            best_match = faculty_id
+                            best_confidence = confidence
+                            
+                except Exception as e:
+                    logger.error(f"Error with model {model}, metric {metric}: {str(e)}")
+                    continue
+                    
+        if best_confidence > confidence_threshold:
+            return best_match, best_confidence
+            
+        return None, 0
+        
+    except Exception as e:
+        logger.error(f"Face matching failed: {str(e)}")
+        return None, 0
+
 @app.post("/faculty_attendance", response_model=Response)
 async def faculty_attendance(location_data: LocationData):
     temp_file_path = None
+    preprocessed_path = None
     try:
+        # Validate and save image
         with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as temp_file:
             image_data = base64.b64decode(location_data.image)
             temp_file.write(image_data)
             temp_file_path = temp_file.name
-
-        if not verify_face_in_image(temp_file_path):
+            
+        # Enhance image quality
+        preprocessed_path = preprocess_image(temp_file_path)
+        
+        # Verify face presence and quality
+        if not verify_face_in_image(preprocessed_path):
             return Response(
                 success=False,
-                message="No clear face detected. Please try again.",
+                message="No clear face detected. Please ensure good lighting and try again.",
                 data={}
             )
-        
+            
+        # Get location info
         try:
             location = geolocator.reverse(f"{location_data.latitude}, {location_data.longitude}")
             address = location.address if location else "Unknown Location"
         except Exception as e:
             logger.error(f"Location lookup failed: {str(e)}")
             address = "Location lookup failed"
-        
-        try:
-            result = DeepFace.find(
-                img_path=temp_file_path,
-                db_path="faculty_photos_db",
-                enforce_detection=True,
-                model_name="VGG-Face",
-                distance_metric="cosine",
-                detector_backend='opencv'
-            )
             
-            if isinstance(result, list) and len(result) > 0 and not result[0].empty:
-                df_result = result[0]
-                df_result = df_result.sort_values('distance')
-                best_match = df_result.iloc[0]
-                
-                identity_path = best_match['identity']
-                faculty_id = os.path.splitext(os.path.basename(identity_path))[0]
-                confidence = 1 - float(best_match['distance'])
-                
-                if confidence > 0.7:
-                    faculty_info_query = supabase.table('faculty_info').select("*").eq('faculty_id', faculty_id).execute()
-                    
-                    if not faculty_info_query.data:
-                        return Response(
-                            success=False,
-                            message="Faculty information not found in database",
-                            data={}
-                        )
-                    
-                    faculty_info = faculty_info_query.data[0]
-                    current_time = datetime.datetime.now()
-                    today_start = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
-                    
-                    attendance_data = {
-                        'faculty_id': faculty_id,
-                        'name': faculty_info['name'],
-                        'department': faculty_info['department'],
-                        'latitude': location_data.latitude,
-                        'longitude': location_data.longitude,
-                        'location_address': address,
-                        'confidence': confidence
-                    }
-
-                    # Check existing attendance
-                    existing_attendance = supabase.table('faculty_attendance')\
-                        .select("*")\
-                        .eq('faculty_id', faculty_id)\
-                        .gte('check_in_time', today_start.isoformat())\
-                        .is_('check_out_time', 'null')\
-                        .execute()
-
-                    if location_data.is_checkout:
-                        if not existing_attendance.data:
-                            return Response(
-                                success=False,
-                                message="No active check-in found. Please check-in first.",
-                                data={}
-                            )
-                        
-                        # Update check-out information
-                        update_data = {
-                            'check_out_time': current_time.isoformat(),
-                            'check_out_latitude': location_data.latitude,
-                            'check_out_longitude': location_data.longitude,
-                            'check_out_address': address
-                        }
-                        
-                        supabase.table('faculty_attendance')\
-                            .update(update_data)\
-                            .eq('id', existing_attendance.data[0]['id'])\
-                            .execute()
-                        
-                        return Response(
-                            success=True,
-                            message=f"Goodbye {faculty_info['name']}! Check-out recorded successfully.",
-                            data=attendance_data
-                        )
-                    else:
-                        if existing_attendance.data:
-                            return Response(
-                                success=False,
-                                message="Already checked in. Please check-out first.",
-                                data={}
-                            )
-                        
-                        # Create new check-in record
-                        attendance_data['check_in_time'] = current_time.isoformat()
-                        supabase.table('faculty_attendance').insert(attendance_data).execute()
-                        
-                        return Response(
-                            success=True,
-                            message=f"Welcome {faculty_info['name']}! Check-in recorded successfully.",
-                            data=attendance_data
-                        )
-                
+        # Find matching faculty
+        faculty_id, confidence = find_matching_face(preprocessed_path)
+        
+        if faculty_id:
+            faculty_info_query = supabase.table('faculty_info').select("*").eq('faculty_id', faculty_id).execute()
+            
+            if not faculty_info_query.data:
                 return Response(
                     success=False,
-                    message="Face match confidence too low. Please try again.",
+                    message="Faculty information not found in database",
                     data={}
                 )
+                
+            faculty_info = faculty_info_query.data[0]
+            current_time = datetime.datetime.now()
+            today_start = current_time.replace(hour=0, minute=0, second=0, microsecond=0)
             
-            return Response(
-                success=False,
-                message="No matching faculty found. Please try again.",
-                data={}
-            )
+            attendance_data = {
+                'faculty_id': faculty_id,
+                'name': faculty_info['name'],
+                'department': faculty_info['department'],
+                'latitude': location_data.latitude,
+                'longitude': location_data.longitude,
+                'location_address': address,
+                'confidence': confidence
+            }
             
-        except Exception as e:
-            logger.error(f"Face recognition error: {traceback.format_exc()}")
-            return Response(
-                success=False,
-                message=f"Face recognition error: {str(e)}. Please try again.",
-                data={}
-            )
-            
+            existing_attendance = supabase.table('faculty_attendance')\
+                .select("*")\
+                .eq('faculty_id', faculty_id)\
+                .gte('check_in_time', today_start.isoformat())\
+                .is_('check_out_time', 'null')\
+                .execute()
+                
+            if location_data.is_checkout:
+                if not existing_attendance.data:
+                    return Response(
+                        success=False,
+                        message="No active check-in found. Please check-in first.",
+                        data={}
+                    )
+                    
+                update_data = {
+                    'check_out_time': current_time.isoformat(),
+                    'check_out_latitude': location_data.latitude,
+                    'check_out_longitude': location_data.longitude,
+                    'check_out_address': address
+                }
+                
+                supabase.table('faculty_attendance')\
+                    .update(update_data)\
+                    .eq('id', existing_attendance.data[0]['id'])\
+                    .execute()
+                    
+                return Response(
+                    success=True,
+                    message=f"Goodbye {faculty_info['name']}! Check-out recorded successfully.",
+                    data=attendance_data
+                )
+            else:
+                if existing_attendance.data:
+                    return Response(
+                        success=False,
+                        message="Already checked in. Please check-out first.",
+                        data={}
+                    )
+                    
+                attendance_data['check_in_time'] = current_time.isoformat()
+                supabase.table('faculty_attendance').insert(attendance_data).execute()
+                
+                return Response(
+                    success=True,
+                    message=f"Welcome {faculty_info['name']}! Check-in recorded successfully.",
+                    data=attendance_data
+                )
+                
+        return Response(
+            success=False,
+            message="No matching faculty found. Please try again or contact administrator.",
+            data={}
+        )
+        
     except Exception as e:
         logger.error(f"Attendance error: {traceback.format_exc()}")
         return Response(
@@ -225,11 +338,13 @@ async def faculty_attendance(location_data: LocationData):
             data={}
         )
     finally:
-        if temp_file_path and os.path.exists(temp_file_path):
-            try:
-                os.unlink(temp_file_path)
-            except Exception as e:
-                logger.error(f"Error cleaning up temporary file: {str(e)}")
+        # Clean up temporary files
+        for path in [temp_file_path, preprocessed_path]:
+            if path and os.path.exists(path):
+                try:
+                    os.unlink(path)
+                except Exception as e:
+                    logger.error(f"Error cleaning up temporary file: {str(e)}")
 
 @app.post("/register_faculty", response_model=Response)
 async def register_faculty(faculty_data: FacultyData):
